@@ -60,6 +60,15 @@ func main() {
 	var qwenLogin bool
 	var iflowLogin bool
 	var iflowCookie bool
+
+	// Whisk flags
+	var whiskLogin bool
+	var whiskCookie bool
+	var whiskNewProfile bool
+	var whiskProfile string
+	var whiskDeleteProfile string
+	var whiskRemoteJson bool
+
 	var noBrowser bool
 	var oauthCallbackPort int
 	var antigravityLogin bool
@@ -75,6 +84,15 @@ func main() {
 	flag.BoolVar(&qwenLogin, "qwen-login", false, "Login to Qwen using OAuth")
 	flag.BoolVar(&iflowLogin, "iflow-login", false, "Login to iFlow using OAuth")
 	flag.BoolVar(&iflowCookie, "iflow-cookie", false, "Login to iFlow using Cookie")
+
+	// Whisk flags definition
+	flag.BoolVar(&whiskLogin, "whisk-login", false, "Login to Whisk using automated browser")
+	flag.BoolVar(&whiskCookie, "whisk-cookie", false, "Login to Whisk using session cookie")
+	flag.BoolVar(&whiskNewProfile, "whisk-new-profile", false, "Create a new Chrome profile for Whisk")
+	flag.StringVar(&whiskProfile, "whisk-profile", "", "Select specific Whisk Chrome profile (email) or 'list' to show all")
+	flag.StringVar(&whiskDeleteProfile, "whisk-delete-profile", "", "Delete a Whisk Chrome profile (email)")
+	flag.BoolVar(&whiskRemoteJson, "whisk-remote-json", false, "Login using JSON from remote /session endpoint")
+
 	flag.BoolVar(&noBrowser, "no-browser", false, "Don't open browser automatically for OAuth")
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
@@ -446,7 +464,6 @@ func main() {
 	configaccess.Register()
 
 	// Handle different command modes based on the provided flags.
-
 	if vertexImport != "" {
 		// Handle Vertex service account import
 		cmd.DoVertexImport(cfg, vertexImport)
@@ -468,6 +485,17 @@ func main() {
 		cmd.DoIFlowLogin(cfg, options)
 	} else if iflowCookie {
 		cmd.DoIFlowCookieAuth(cfg, options)
+		// --- Whisk Handlers ---
+	} else if whiskRemoteJson {
+		cmd.DoWhiskPasteJsonLogin(cfg, options)
+	} else if whiskDeleteProfile != "" {
+		cmd.DoWhiskDeleteProfile(cfg, whiskDeleteProfile)
+	} else if whiskProfile == "list" {
+		cmd.DoWhiskListProfiles(cfg)
+	} else if whiskLogin {
+		cmd.DoWhiskLogin(cfg, options, false, whiskProfile, whiskNewProfile) // headless=false
+	} else if whiskCookie {
+		cmd.DoWhiskCookieAuth(cfg, options)
 	} else {
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {

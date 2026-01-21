@@ -124,6 +124,10 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return walkErr
 		}
 		if d.IsDir() {
+			name := strings.ToLower(d.Name())
+			if strings.HasPrefix(name, "chrome-") || name == "browser-data" || name == "node_modules" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {

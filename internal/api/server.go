@@ -34,6 +34,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/openai"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers/whisk"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -325,6 +326,13 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+
+		// Whisk API routes
+		whiskHandlers := whisk.NewWhiskAPIHandler(s.handlers, s.cfg)
+		v1.POST("/whisk/refine", whiskHandlers.RefineImage)
+		v1.POST("/whisk/upload", whiskHandlers.UploadImage)
+		v1.POST("/whisk/caption", whiskHandlers.GenerateCaption)
+		v1.POST("/images/generations", whiskHandlers.ImageGenerations)
 	}
 
 	// Gemini compatible API routes

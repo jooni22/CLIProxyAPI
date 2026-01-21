@@ -882,3 +882,28 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 
 	return nil
 }
+
+// GetWhiskModels returns the Whisk image generation model definitions.
+// Whisk exposes gemini-2.5-flash-image (GEM_PIX) and Imagen 3.5 via Google Labs API.
+func GetWhiskModels() []*ModelInfo {
+	return []*ModelInfo{
+		{
+			ID:          "gemini-2.5-flash-image",
+			Object:      "model",
+			Created:     1756166400,
+			OwnedBy:     "google",
+			Type:        "whisk",
+			DisplayName: "Gemini 2.5 Flash Image (Whisk)",
+			Description: "Gemini 2.5 Flash Image model for editing via Whisk/Google Labs API (GEM_PIX)",
+		},
+		{
+			ID:          "imagen-3.5",
+			Object:      "model",
+			Created:     1756166400,
+			OwnedBy:     "google",
+			Type:        "whisk",
+			DisplayName: "Imagen 3.5 (Whisk)",
+			Description: "Imagen 3.5 image generation via Whisk/Google Labs API",
+		},
+	}
+}

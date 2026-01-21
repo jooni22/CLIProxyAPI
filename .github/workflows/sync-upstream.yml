@@ -1,0 +1,126 @@
+name: Sync Upstream & Notify
+
+on:
+  schedule:
+    # Codziennie o 6:00 UTC (7:00 CET)
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Ręczne uruchomienie
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.check.outputs.has_updates }}
+      commit_count: ${{ steps.check.outputs.commit_count }}
+      
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/pashpashpash/cli-proxy-api.git || true
+          git fetch upstream main
+          
+      - name: Check for new commits
+        id: check
+        run: |
+          COMMITS=$(git rev-list main..upstream/main --count)
+          echo "commit_count=$COMMITS" >> $GITHUB_OUTPUT
+          if [ "$COMMITS" -gt 0 ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "🔔 Found $COMMITS new commits from upstream!"
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "✅ No new commits from upstream"
+          fi
+
+  sync-main:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+      - name: Sync main with upstream
+        run: |
+          git remote add upstream https://github.com/pashpashpash/cli-proxy-api.git || true
+          git fetch upstream main
+          git checkout main
+          git merge upstream/main --no-edit
+          git push origin main
+          
+      - name: Create Issue for rebase
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commits = ${{ needs.check-upstream.outputs.commit_count }};
+            
+            // Get recent commits from upstream
+            const { execSync } = require('child_process');
+            const log = execSync('git log main~' + commits + '..main --oneline').toString();
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔄 Upstream updated: ${commits} new commit(s)`,
+              body: `## Upstream CLIProxyAPI Updated!
+              
+Branch \`main\` was automatically synced with upstream.
+
+### New commits:
+\`\`\`
+${log}
+\`\`\`
+
+### Action Required:
+Rebase your custom branch to include these changes:
+
+\`\`\`bash
+git fetch origin
+git checkout custom
+git rebase origin/main
+
+# If conflicts:
+# Fix them, then:
+git rebase --continue
+
+# Push updated branch:
+git push origin custom --force-with-lease
+\`\`\`
+
+### Quick Patch Workflow:
+If rebase is too complex, use patch-manager:
+
+\`\`\`bash
+# 1. Save current work
+python3 patch-manager/scripts/create_patch.py --path CLIProxyAPI before_sync
+
+# 2. Reset to updated main
+cd CLIProxyAPI
+git checkout custom
+git reset --hard origin/main
+
+# 3. Apply your patches
+cd ..
+python3 patch-manager/scripts/apply_patch.py --path CLIProxyAPI 0
+\`\`\`
+              `,
+              labels: ['upstream-sync', 'needs-rebase']
+            });
