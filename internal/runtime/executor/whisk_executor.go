@@ -28,7 +28,13 @@ import (
 const (
 	// Standard Whisk models
 	WhiskModelImagen35 = "IMAGEN_3_5"
+	WhiskModelImagen31 = "IMAGEN_3_1"
 	WhiskModelGemPix   = "GEM_PIX"
+	WhiskModelR2I      = "R2I"
+
+	DefaultGeminiImageModel = "gemini-2.5-flash-image"
+
+	base64Marker = "base64,"
 )
 
 var (
@@ -579,12 +585,7 @@ func parseGeminiImageRequest(payload []byte) (geminiImageRequest, error) {
 	if candidateCount == 0 {
 		candidateCount = int(genConfig.Get("candidate_count").Int())
 	}
-	if candidateCount <= 0 {
-		candidateCount = 1
-	}
-	if candidateCount > 4 {
-		candidateCount = 4
-	}
+	candidateCount = clampCandidateCount(candidateCount)
 
 	aspectRatio := ""
 	if aspect := genConfig.Get("imageConfig.aspectRatio"); aspect.Exists() {
@@ -661,8 +662,9 @@ func extractGeminiTextParts(content gjson.Result) []string {
 }
 
 func normalizeInlineImageData(data string) string {
-	if idx := strings.Index(strings.ToLower(data), "base64,"); idx >= 0 {
-		return data[idx+7:]
+	lower := strings.ToLower(data)
+	if idx := strings.Index(lower, base64Marker); idx >= 0 {
+		return data[idx+len(base64Marker):]
 	}
 	return data
 }
@@ -672,6 +674,7 @@ func normalizeGeminiAspectRatio(value string) string {
 	if raw == "" {
 		return ""
 	}
+	// Whisk only exposes portrait/landscape/square buckets, so map Gemini ratios into those buckets.
 	switch raw {
 	case "1:1", "square":
 		return AspectRatioSquare
@@ -694,9 +697,20 @@ func normalizeGeminiAspectRatio(value string) string {
 				}
 				return AspectRatioPortrait
 			}
+			// Ignore malformed ratios; caller will fall back to default buckets.
 		}
 	}
 	return ""
+}
+
+func clampCandidateCount(count int) int {
+	if count <= 0 {
+		return 1
+	}
+	if count > 4 {
+		return 4
+	}
+	return count
 }
 
 func normalizeWhiskGeminiModel(model string) string {
@@ -705,7 +719,7 @@ func normalizeWhiskGeminiModel(model string) string {
 		return WhiskModelGemPix
 	}
 	upper := strings.ToUpper(trimmed)
-	if upper == WhiskModelGemPix || upper == WhiskModelImagen35 || upper == "IMAGEN_3_1" || upper == "R2I" {
+	if upper == WhiskModelGemPix || upper == WhiskModelImagen35 || upper == WhiskModelImagen31 || upper == WhiskModelR2I {
 		return upper
 	}
 	lower := strings.ToLower(trimmed)
@@ -725,6 +739,7 @@ func buildGeminiImageResponse(model string, images []WhiskImageData, includeText
 	}
 	candidates := make([]map[string]any, 0, len(images))
 	for _, img := range images {
+		// Whisk responses can include data URL prefixes, so normalize if present.
 		parts := []map[string]any{{
 			"inlineData": map[string]any{
 				"mimeType": "image/png",
@@ -776,15 +791,14 @@ func buildGeminiTextResponse(model string, texts []string) ([]byte, error) {
 }
 
 func buildGeminiResponse(model string, candidates []map[string]any) ([]byte, error) {
+	modelVersion := strings.TrimSpace(model)
+	if modelVersion == "" {
+		modelVersion = DefaultGeminiImageModel
+	}
 	response := map[string]any{
-		"candidates": candidates,
-		"responseId": uuid.New().String(),
-		"modelVersion": func() string {
-			if strings.TrimSpace(model) != "" {
-				return model
-			}
-			return "gemini-2.5-flash-image"
-		}(),
+		"candidates":   candidates,
+		"responseId":   uuid.New().String(),
+		"modelVersion": modelVersion,
 		"usageMetadata": map[string]any{
 			"promptTokenCount":     0,
 			"candidatesTokenCount": 0,
@@ -832,7 +846,7 @@ func (e *WhiskExecutor) GenerateImage(ctx context.Context, auth *cliproxyauth.Au
 
 	model := req.Model
 	if model == "" {
-		model = "IMAGEN_3_1" // Default to 3.1 as per comfyui_whisk.py
+		model = WhiskModelImagen31 // Default to 3.1 as per ComfyUI whisk.py
 	}
 	aspectRatio := req.AspectRatio
 	if aspectRatio == "" {
@@ -840,13 +854,7 @@ func (e *WhiskExecutor) GenerateImage(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	// Payload construction matching v1:runImageFx
-	candidatesCount := req.NumImages
-	if candidatesCount <= 0 {
-		candidatesCount = 1
-	}
-	if candidatesCount > 4 {
-		candidatesCount = 4
-	}
+	candidatesCount := clampCandidateCount(req.NumImages)
 	userInput := map[string]any{
 		"candidatesCount": candidatesCount,
 		"prompts":         []string{req.Prompt},
