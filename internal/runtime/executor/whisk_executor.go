@@ -20,6 +20,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -150,11 +152,138 @@ func (e *WhiskExecutor) Identifier() string {
 }
 
 func (e *WhiskExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, fmt.Errorf("whisk executor does not support generic Execute (use specific image/video methods)")
+	// Whisk compatible execution for native Gemini API format
+	root := gjson.ParseBytes(req.Payload)
+
+	// Extract text and images from 'contents'
+	var textBuilder strings.Builder
+	var imageB64s []string
+
+	root.Get("contents").ForEach(func(_, content gjson.Result) bool {
+		content.Get("parts").ForEach(func(_, part gjson.Result) bool {
+			if textPart := part.Get("text"); textPart.Exists() {
+				if textBuilder.Len() > 0 {
+					textBuilder.WriteString(" ")
+				}
+				textBuilder.WriteString(textPart.String())
+			}
+			if inlineData := part.Get("inline_data"); inlineData.Exists() {
+				if data := inlineData.Get("data"); data.Exists() {
+					imageB64s = append(imageB64s, data.String())
+				}
+			}
+			return true
+		})
+		return true
+	})
+
+	prompt := textBuilder.String()
+
+	// Extract generationConfig
+	aspectRatio := AspectRatioSquare
+	if ar := root.Get("generationConfig.imageConfig.aspectRatio"); ar.Exists() {
+		aspectRatio = mapGeminiAspectRatioToWhisk(ar.String())
+	}
+
+	// Choose operation
+	var result *WhiskImageResponse
+	var err error
+
+	if len(imageB64s) > 0 {
+		// We have images. Decide between Caption and Refine.
+		lowerPrompt := strings.ToLower(prompt)
+		isDescription := strings.Contains(lowerPrompt, "describe") ||
+			strings.Contains(lowerPrompt, "what is") ||
+			strings.Contains(lowerPrompt, "what's") ||
+			strings.Contains(lowerPrompt, "tell me about") ||
+			strings.Contains(lowerPrompt, "caption")
+
+		if isDescription && prompt != "" {
+			captions, cErr := e.GenerateCaption(ctx, auth, imageB64s[0], 1)
+			if cErr != nil {
+				return cliproxyexecutor.Response{}, cErr
+			}
+			if len(captions) == 0 {
+				return cliproxyexecutor.Response{}, fmt.Errorf("whisk: no caption generated")
+			}
+			// Format caption as text response
+			return formatGeminiTextResponse(captions[0], req.Model), nil
+		} else {
+			// Edit/Refine
+			result, err = e.RefineImage(ctx, auth, imageB64s[0], prompt, "", WhiskModelGemPix, aspectRatio, true)
+		}
+	} else {
+		// Generation
+		whiskReq := WhiskImageRequest{
+			Prompt:      prompt,
+			Model:       WhiskModelImagen35, // Use 3.5 for generations
+			AspectRatio: aspectRatio,
+			NumImages:   1,
+		}
+		result, err = e.GenerateImage(ctx, auth, whiskReq)
+	}
+
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
+	// Format result back to Gemini
+	return formatGeminiImageResponse(result, req.Model), nil
 }
 
 func (e *WhiskExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
-	return nil, fmt.Errorf("whisk executor does not support streaming")
+	resp, err := e.Execute(ctx, auth, req, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	ch <- cliproxyexecutor.StreamChunk{Payload: resp.Payload}
+	close(ch)
+	return ch, nil
+}
+
+func mapGeminiAspectRatioToWhisk(geminiAR string) string {
+	switch strings.ReplaceAll(geminiAR, ":", "x") {
+	case "1x1", "square":
+		return AspectRatioSquare
+	case "16x9", "landscape":
+		return AspectRatioLandscape
+	case "9x16", "portrait":
+		return AspectRatioPortrait
+	default:
+		return AspectRatioPortrait
+	}
+}
+
+func formatGeminiTextResponse(text, model string) cliproxyexecutor.Response {
+	res := `{"candidates":[{"content":{"parts":[{"text":""}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}`
+	res, _ = sjson.Set(res, "candidates.0.content.parts.0.text", text)
+	res, _ = sjson.Set(res, "model", model)
+	return cliproxyexecutor.Response{Payload: []byte(res)}
+}
+
+func formatGeminiImageResponse(result *WhiskImageResponse, model string) cliproxyexecutor.Response {
+	res := `{"candidates":[{"content":{"parts":[],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}`
+	res, _ = sjson.Set(res, "model", model)
+
+	for i, img := range result.Data {
+		path := fmt.Sprintf("candidates.0.content.parts.%d.inlineData", i)
+		inlineData := map[string]string{
+			"mimeType": "image/png",
+			"data":     img.B64JSON,
+		}
+		inlineDataJSON, _ := json.Marshal(inlineData)
+		res, _ = sjson.SetRaw(res, path, string(inlineDataJSON))
+
+		// Also add revised prompt as text part if available
+		if img.Prompt != "" {
+			textPath := fmt.Sprintf("candidates.0.content.parts.%d.text", len(result.Data)+i)
+			res, _ = sjson.Set(res, textPath, "Revised prompt: "+img.Prompt)
+		}
+	}
+
+	return cliproxyexecutor.Response{Payload: []byte(res)}
 }
 
 func (e *WhiskExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -869,8 +998,8 @@ func (e *WhiskExecutor) GenerateCaption(ctx context.Context, auth *cliproxyauth.
 
 func (e *WhiskExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	// Whisk image generation models do not expose token counting in the same way as LLMs.
-	// Returning 0 or a stub value is appropriate here as this method is likely not used for image models.
-	return cliproxyexecutor.Response{}, nil
+	// Returning a stub value for Gemini compatibility.
+	return cliproxyexecutor.Response{Payload: []byte(`{"totalTokens":1}`)}, nil
 }
 
 func (e *WhiskExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
