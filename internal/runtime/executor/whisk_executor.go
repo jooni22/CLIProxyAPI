@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -150,7 +152,60 @@ func (e *WhiskExecutor) Identifier() string {
 }
 
 func (e *WhiskExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, fmt.Errorf("whisk executor does not support generic Execute (use specific image/video methods)")
+	geminiReq, err := parseGeminiImageRequest(req.Payload)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
+	model := normalizeWhiskGeminiModel(req.Model)
+	aspectRatio := geminiReq.AspectRatio
+	if geminiReq.ImageBase64 == "" {
+		if strings.TrimSpace(geminiReq.Prompt) == "" {
+			return cliproxyexecutor.Response{}, fmt.Errorf("whisk gemini: prompt is required")
+		}
+		whiskReq := WhiskImageRequest{
+			Prompt:      geminiReq.Prompt,
+			Model:       model,
+			AspectRatio: aspectRatio,
+			NumImages:   geminiReq.CandidateCount,
+			Seed:        geminiReq.Seed,
+		}
+		result, err := e.GenerateImage(ctx, auth, whiskReq)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		payload, err := buildGeminiImageResponse(req.Model, result.Data, geminiReq.WantsText(), geminiReq.Prompt)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		return cliproxyexecutor.Response{Payload: payload}, nil
+	}
+
+	if geminiReq.WantsImage() {
+		instruction := strings.TrimSpace(geminiReq.Prompt)
+		if instruction == "" {
+			instruction = "enhance image quality"
+		}
+		result, err := e.RefineImage(ctx, auth, geminiReq.ImageBase64, instruction, "", model, aspectRatio, false)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		payload, err := buildGeminiImageResponse(req.Model, result.Data, geminiReq.WantsText(), instruction)
+		if err != nil {
+			return cliproxyexecutor.Response{}, err
+		}
+		return cliproxyexecutor.Response{Payload: payload}, nil
+	}
+
+	captions, err := e.GenerateCaption(ctx, auth, geminiReq.ImageBase64, geminiReq.CandidateCount)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	payload, err := buildGeminiTextResponse(req.Model, captions)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: payload}, nil
 }
 
 func (e *WhiskExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
@@ -450,6 +505,295 @@ func buildWhiskCookieFromToken(auth *cliproxyauth.Auth) string {
 	return whiskFullCookie(auth)
 }
 
+type geminiImageRequest struct {
+	Prompt             string
+	ImageBase64        string
+	AspectRatio        string
+	CandidateCount     int
+	ResponseModalities map[string]bool
+	Seed               int
+}
+
+func (g geminiImageRequest) WantsImage() bool {
+	if len(g.ResponseModalities) == 0 {
+		return true
+	}
+	return g.ResponseModalities["IMAGE"]
+}
+
+func (g geminiImageRequest) WantsText() bool {
+	return g.ResponseModalities["TEXT"]
+}
+
+func parseGeminiImageRequest(payload []byte) (geminiImageRequest, error) {
+	if len(payload) == 0 {
+		return geminiImageRequest{}, fmt.Errorf("whisk gemini: empty payload")
+	}
+	root := gjson.ParseBytes(payload)
+	contents := root.Get("contents")
+	if !contents.Exists() {
+		contents = root.Get("request.contents")
+	}
+	if !contents.Exists() || !contents.IsArray() {
+		return geminiImageRequest{}, fmt.Errorf("whisk gemini: contents are required")
+	}
+
+	promptParts := make([]string, 0)
+	systemInstruction := root.Get("systemInstruction")
+	if !systemInstruction.Exists() {
+		systemInstruction = root.Get("request.systemInstruction")
+	}
+	promptParts = append(promptParts, extractGeminiTextParts(systemInstruction)...)
+
+	imageBase64 := ""
+	for _, content := range contents.Array() {
+		parts := content.Get("parts").Array()
+		for _, part := range parts {
+			if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+				promptParts = append(promptParts, text)
+			}
+			if imageBase64 != "" {
+				continue
+			}
+			inlineData := part.Get("inlineData")
+			if !inlineData.Exists() {
+				inlineData = part.Get("inline_data")
+			}
+			if !inlineData.Exists() {
+				continue
+			}
+			data := inlineData.Get("data").String()
+			if data == "" {
+				continue
+			}
+			imageBase64 = normalizeInlineImageData(data)
+		}
+	}
+
+	genConfig := root.Get("generationConfig")
+	if !genConfig.Exists() {
+		genConfig = root.Get("request.generationConfig")
+	}
+
+	candidateCount := int(genConfig.Get("candidateCount").Int())
+	if candidateCount == 0 {
+		candidateCount = int(genConfig.Get("candidate_count").Int())
+	}
+	if candidateCount <= 0 {
+		candidateCount = 1
+	}
+	if candidateCount > 4 {
+		candidateCount = 4
+	}
+
+	aspectRatio := ""
+	if aspect := genConfig.Get("imageConfig.aspectRatio"); aspect.Exists() {
+		aspectRatio = normalizeGeminiAspectRatio(aspect.String())
+	}
+	if aspectRatio == "" {
+		if aspect := genConfig.Get("imageConfig.aspect_ratio"); aspect.Exists() {
+			aspectRatio = normalizeGeminiAspectRatio(aspect.String())
+		}
+	}
+	if aspectRatio == "" {
+		if size := genConfig.Get("imageConfig.imageSize"); size.Exists() {
+			aspectRatio = normalizeGeminiAspectRatio(size.String())
+		}
+	}
+	if aspectRatio == "" {
+		if size := genConfig.Get("imageConfig.image_size"); size.Exists() {
+			aspectRatio = normalizeGeminiAspectRatio(size.String())
+		}
+	}
+
+	modalities := parseGeminiModalities(genConfig)
+
+	seed := int(genConfig.Get("seed").Int())
+	if seed == 0 {
+		seed = int(genConfig.Get("randomSeed").Int())
+	}
+	if seed == 0 {
+		seed = int(genConfig.Get("random_seed").Int())
+	}
+
+	return geminiImageRequest{
+		Prompt:             strings.TrimSpace(strings.Join(promptParts, "\n")),
+		ImageBase64:        imageBase64,
+		AspectRatio:        aspectRatio,
+		CandidateCount:     candidateCount,
+		ResponseModalities: modalities,
+		Seed:               seed,
+	}, nil
+}
+
+func parseGeminiModalities(genConfig gjson.Result) map[string]bool {
+	result := map[string]bool{}
+	mods := genConfig.Get("responseModalities")
+	if !mods.Exists() {
+		mods = genConfig.Get("response_modalities")
+	}
+	if mods.Exists() && mods.IsArray() {
+		for _, mod := range mods.Array() {
+			value := strings.ToUpper(strings.TrimSpace(mod.String()))
+			if value != "" {
+				result[value] = true
+			}
+		}
+	}
+	return result
+}
+
+func extractGeminiTextParts(content gjson.Result) []string {
+	if !content.Exists() {
+		return nil
+	}
+	parts := content.Get("parts")
+	if !parts.Exists() || !parts.IsArray() {
+		return nil
+	}
+	texts := make([]string, 0, len(parts.Array()))
+	for _, part := range parts.Array() {
+		if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return texts
+}
+
+func normalizeInlineImageData(data string) string {
+	if idx := strings.Index(strings.ToLower(data), "base64,"); idx >= 0 {
+		return data[idx+7:]
+	}
+	return data
+}
+
+func normalizeGeminiAspectRatio(value string) string {
+	raw := strings.ToLower(strings.TrimSpace(value))
+	if raw == "" {
+		return ""
+	}
+	switch raw {
+	case "1:1", "square":
+		return AspectRatioSquare
+	case "9:16", "3:4", "portrait":
+		return AspectRatioPortrait
+	case "16:9", "4:3", "landscape":
+		return AspectRatioLandscape
+	}
+	if strings.Contains(raw, "x") {
+		parts := strings.Split(raw, "x")
+		if len(parts) == 2 {
+			width, errWidth := strconv.Atoi(strings.TrimSpace(parts[0]))
+			height, errHeight := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if errWidth == nil && errHeight == nil {
+				if width == height {
+					return AspectRatioSquare
+				}
+				if width > height {
+					return AspectRatioLandscape
+				}
+				return AspectRatioPortrait
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeWhiskGeminiModel(model string) string {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return WhiskModelGemPix
+	}
+	upper := strings.ToUpper(trimmed)
+	if upper == WhiskModelGemPix || upper == WhiskModelImagen35 || upper == "IMAGEN_3_1" || upper == "R2I" {
+		return upper
+	}
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.Contains(lower, "imagen") || strings.Contains(lower, "3.5") || strings.Contains(lower, "3_5"):
+		return WhiskModelImagen35
+	case strings.Contains(lower, "gem") || strings.Contains(lower, "flash-image"):
+		return WhiskModelGemPix
+	default:
+		return WhiskModelGemPix
+	}
+}
+
+func buildGeminiImageResponse(model string, images []WhiskImageData, includeText bool, fallbackText string) ([]byte, error) {
+	if len(images) == 0 {
+		return nil, fmt.Errorf("whisk gemini: no images in response")
+	}
+	candidates := make([]map[string]any, 0, len(images))
+	for _, img := range images {
+		parts := []map[string]any{{
+			"inlineData": map[string]any{
+				"mimeType": "image/png",
+				"data":     normalizeInlineImageData(img.B64JSON),
+			},
+		}}
+		if includeText {
+			text := strings.TrimSpace(img.Prompt)
+			if text == "" {
+				text = strings.TrimSpace(fallbackText)
+			}
+			if text != "" {
+				parts = append(parts, map[string]any{"text": text})
+			}
+		}
+		candidates = append(candidates, map[string]any{
+			"content": map[string]any{
+				"parts": parts,
+				"role":  "model",
+			},
+			"finishReason": "STOP",
+		})
+	}
+	return buildGeminiResponse(model, candidates)
+}
+
+func buildGeminiTextResponse(model string, texts []string) ([]byte, error) {
+	if len(texts) == 0 {
+		return nil, fmt.Errorf("whisk gemini: empty text response")
+	}
+	candidates := make([]map[string]any, 0, len(texts))
+	for _, text := range texts {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		candidates = append(candidates, map[string]any{
+			"content": map[string]any{
+				"parts": []map[string]any{{"text": text}},
+				"role":  "model",
+			},
+			"finishReason": "STOP",
+		})
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("whisk gemini: empty text response")
+	}
+	return buildGeminiResponse(model, candidates)
+}
+
+func buildGeminiResponse(model string, candidates []map[string]any) ([]byte, error) {
+	response := map[string]any{
+		"candidates": candidates,
+		"responseId": uuid.New().String(),
+		"modelVersion": func() string {
+			if strings.TrimSpace(model) != "" {
+				return model
+			}
+			return "gemini-2.5-flash-image"
+		}(),
+		"usageMetadata": map[string]any{
+			"promptTokenCount":     0,
+			"candidatesTokenCount": 0,
+			"totalTokenCount":      0,
+		},
+	}
+	return json.Marshal(response)
+}
+
 // --- Request/Response structs ---
 
 type WhiskImageRequest struct {
@@ -496,8 +840,15 @@ func (e *WhiskExecutor) GenerateImage(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	// Payload construction matching v1:runImageFx
+	candidatesCount := req.NumImages
+	if candidatesCount <= 0 {
+		candidatesCount = 1
+	}
+	if candidatesCount > 4 {
+		candidatesCount = 4
+	}
 	userInput := map[string]any{
-		"candidatesCount": 1,
+		"candidatesCount": candidatesCount,
 		"prompts":         []string{req.Prompt},
 		"seed":            req.Seed,
 	}
